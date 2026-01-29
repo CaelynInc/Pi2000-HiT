@@ -6,16 +6,54 @@ import time
 import json
 import re
 import uuid
+import os
+import signal
 from datetime import datetime, timezone
 
+# RabbitMQ settings
 RABBITMQ_HOST = "vps.caelyn.nl"
 RABBITMQ_USER = "p2000"
 RABBITMQ_PASS = "Pi2000"
 RABBITMQ_QUEUE = "p2000"
 
+# SDR settings
 FREQUENCY = "169.65M"
 
-def start_pipeline():
+# Logging
+LOG_DIR = "/var/log/p2000"
+LOG_FILE = f"{LOG_DIR}/p2000.log"
+
+# Graceful shutdown flag
+running = True
+
+
+def log(msg):
+    timestamp = datetime.now(timezone.utc).isoformat()
+    line = f"{timestamp} | {msg}"
+
+    # Print to journald (stdout)
+    print(line, flush=True)
+
+    # Append to file
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def handle_signal(signum, frame):
+    global running
+    running = False
+    log(f"Received signal {signum}, shutting down...")
+
+
+for s in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(s, handle_signal)
+
+
+def start_decoder():
+    """Start rtl_fm + multimon-ng."""
     rtl_cmd = [
         "rtl_fm",
         "-f", FREQUENCY,
@@ -32,75 +70,83 @@ def start_pipeline():
         "-"
     ]
 
-    rtl_proc = subprocess.Popen(
+    log("Starting decoder pipeline...")
+
+    rtl = subprocess.Popen(
         rtl_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL
     )
 
-    multi_proc = subprocess.Popen(
+    multi = subprocess.Popen(
         multi_cmd,
-        stdin=rtl_proc.stdout,
+        stdin=rtl.stdout,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True
     )
-    return multi_proc
+
+    return rtl, multi
+
 
 def connect_rabbit():
     credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
-    while True:
+
+    while running:
         try:
-            connection = pika.BlockingConnection(
+            log("Connecting to RabbitMQ...")
+            conn = pika.BlockingConnection(
                 pika.ConnectionParameters(
                     host=RABBITMQ_HOST,
-                    credentials=credentials
+                    credentials=credentials,
+                    heartbeat=30
                 )
             )
-            channel = connection.channel()
-            channel.queue_declare(
+            ch = conn.channel()
+            ch.queue_declare(
                 queue=RABBITMQ_QUEUE,
                 durable=True,
                 arguments={'x-message-ttl': 300000}
             )
-            print("[+] Connected to RabbitMQ")
-            return connection, channel
+            log("RabbitMQ connected.")
+            return conn, ch
         except Exception as e:
-            print(f"[-] RabbitMQ unavailable ({e}), retrying...")
+            log(f"RabbitMQ connection failed: {e}")
             time.sleep(5)
 
-def parse_p2000_line(line):
+    return None, None
+
+
+def parse_flex_line(line):
+    """Parse FLEX output into structured JSON."""
     parts = line.split('|')
 
     if len(parts) < 7:
         message_text = line
         capcodes = []
+        timestamp_raw = None
         prio = None
         grip = None
-        timestamp = None
     else:
+        timestamp_raw = parts[1]
         message_text = '|'.join(parts[5:]).strip()
-        capcodes = parts[4].strip().split() if parts[4].strip() else []
-        timestamp = parts[1]
+        capcodes = parts[4].split() if parts[4].strip() else []
 
-        prio_match = re.search(r'\b(A[1-2]|B1|P[1-3]|PRIO\s?[1-5])\b', message_text, re.IGNORECASE)
+        prio_match = re.search(r'\b(A[1-2]|B1|P[1-3]|PRIO\s?[1-5])\b', message_text, re.I)
         prio = prio_match.group(0) if prio_match else None
 
-        grip_match = re.search(r'\bGRIP\s?([1-4])\b', message_text, re.IGNORECASE)
+        grip_match = re.search(r'\bGRIP\s?([1-4])\b', message_text, re.I)
         grip = f"GRIP {grip_match.group(1)}" if grip_match else None
 
     now = datetime.now(timezone.utc)
-    unix_ts = int(now.timestamp())
-    iso_ts = now.isoformat()
 
     return {
         "id": str(uuid.uuid4()),
         "protocol": "FLEX",
-        "timestamp_unix": unix_ts,
-        "timestamp_iso": iso_ts,
-
+        "timestamp_unix": int(now.timestamp()),
+        "timestamp_iso": now.isoformat(),
+        "raw_flex_timestamp": timestamp_raw,
         "raw": line,
-
         "data": {
             "message": message_text,
             "prio": prio,
@@ -109,32 +155,72 @@ def parse_p2000_line(line):
         }
     }
 
+
 def main():
-    connection, channel = connect_rabbit()
-    decoder = start_pipeline()
+    # Ensure log directory exists
+    os.makedirs(LOG_DIR, exist_ok=True)
 
-    print("[+] Listening for P2000 messages...")
+    fail_counter = 0
 
-    for line in decoder.stdout:
-        line = line.strip()
-        if not line or line.startswith("Enabled demodulators:"):
-            continue
+    while running:
+        conn, ch = connect_rabbit()
+        if not conn:
+            break
 
-        msg = parse_p2000_line(line)
-        msg_json = json.dumps(msg)
+        rtl_proc, multi_proc = start_decoder()
 
-        print("[RX]", msg_json)
+        log("Decoder running. Waiting for messages...")
 
-        channel.basic_publish(
-            exchange='',
-            routing_key=RABBITMQ_QUEUE,
-            body=msg_json.encode("utf8"),
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
+        try:
+            while running:
+                line = multi_proc.stdout.readline()
+
+                if not line:
+                    # No data — FLEX is bursty; wait and continue
+                    time.sleep(0.1)
+                    continue
+
+                line = line.strip()
+                if not line or line.startswith("Enabled demodulators:"):
+                    continue
+
+                msg = parse_flex_line(line)
+                msg_json = json.dumps(msg)
+
+                log(f"RX {msg_json}")
+
+                try:
+                    ch.basic_publish(
+                        exchange='',
+                        routing_key=RABBITMQ_QUEUE,
+                        body=msg_json.encode("utf8"),
+                        properties=pika.BasicProperties(delivery_mode=2)
+                    )
+                except Exception as e:
+                    log(f"Publish failed: {e}")
+                    break  # reconnect
+
+        except Exception as e:
+            log(f"Decoder loop error: {e}")
+        finally:
+            fail_counter += 1
+
+            if rtl_proc.poll() is None:
+                rtl_proc.kill()
+
+            if multi_proc.poll() is None:
+                multi_proc.kill()
+
+            if conn.is_open:
+                conn.close()
+
+            # Backoff if crashing repeatedly
+            sleep_time = min(30, fail_counter * 3)
+            log(f"Restarting decoder in {sleep_time} seconds...")
+            time.sleep(sleep_time)
+
+    log("Service stopped.")
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("Stopping...")
-        sys.exit(0)
+    main()
